@@ -36,4 +36,5 @@ set_global_assignment -name VERILOG_FILE rtl/STARFORC_board1.v
 set_global_assignment -name VERILOG_FILE rtl/NANO_STARFORC.v
 set_global_assignment -name SDC_FILE "Arcade-Starforce.sdc"
 set_global_assignment -name SYSTEMVERILOG_FILE "Arcade-Starforce.sv"
-
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/starforce_ra_tap_merge.sv
+set_global_assignment -name VERILOG_FILE rtl/starforce_ra_mirror.v

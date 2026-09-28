@@ -217,7 +217,7 @@ module emu
    
 `include "build_id.v" 
    localparam CONF_STR = {
-                          "StarForce;;",
+                          "RA_StarForce;;",
                           "-;",
                           "HFO1,Aspect Ratio,Original,Wide;",
                           "HFO2,Orientation,Vert,Horz;",
@@ -301,18 +301,32 @@ module emu
       
       );
         
+	// The rotation framebuffer shares the DDR port with the RetroAchievements
+	// mirror (see RETROACHIEVEMENTS below), so its DDRAM outputs go through the RA mux.
+	wire  [7:0] rot_burstcnt, rot_be;
+	wire [28:0] rot_addr;
+	wire [63:0] rot_din;
+	wire        rot_we, rot_rd;
+
 `ifdef MISTER_FB
 
 	screen_rotate screen_rotate
 	(
 		.*,
 		.video_rotated(),
-		.rotate_ccw(0)
+		.rotate_ccw(0),
+		.DDRAM_CLK(),
+		.DDRAM_BURSTCNT(rot_burstcnt),
+		.DDRAM_ADDR(rot_addr),
+		.DDRAM_DIN(rot_din),
+		.DDRAM_BE(rot_be),
+		.DDRAM_WE(rot_we),
+		.DDRAM_RD(rot_rd)
 	);
 
 `else
 	
-	assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = '0;  
+	assign {rot_burstcnt, rot_addr, rot_din, rot_be, rot_rd, rot_we} = '0;
 	
 `endif        
         
@@ -430,6 +444,11 @@ module emu
    reg [7:0]   sw[8];
    always @(posedge clk_sys) if (ioctl_wr && (ioctl_index==254) && !ioctl_addr[24:3]) sw[ioctl_addr[2:0]] <= ioctl_dout;
    
+   // RetroAchievements tap (see RETROACHIEVEMENTS below)
+   wire [15:0] ra_cpu0_a, ra_cpu1_a;
+   wire  [7:0] ra_cpu0_do, ra_cpu1_do;
+   wire        ra_cpu0_we, ra_cpu1_we;
+
    NANO_STARFORC starforce
      (
       
@@ -462,7 +481,137 @@ module emu
       .UDLRTSC ( UDLRTSC ),
       .dipsw ( { sw[0],sw[1]} ),
       .muteki ( status[6] ),
-      
+
+      .ra_cpu0_a  ( ra_cpu0_a  ),
+      .ra_cpu0_do ( ra_cpu0_do ),
+      .ra_cpu0_we ( ra_cpu0_we ),
+      .ra_cpu1_a  ( ra_cpu1_a  ),
+      .ra_cpu1_do ( ra_cpu1_do ),
+      .ra_cpu1_we ( ra_cpu1_we )
       );
-   
+
+///////////////////   RETROACHIEVEMENTS   //////////////////
+//
+// RAM mirror for the RetroAchievements fork of Main_MiSTer
+// (starforce_ra_mirror.v, from jotego's jtframe via the RA jtcores fork). RA
+// arcade sets are written against FinalBurn Neo, whose Star Force driver
+// (d_senjyo.cpp) exposes the MemIndex concatenation as "All Ram":
+//     0x0000 DrvZ80RAM0  0x1000  main Z80 8000-8FFF
+//     0x1000 DrvFgRAM    0x0800  main Z80 9000-97FF
+//     0x1800 DrvSprRAM   0x0100  main Z80 9800-98FF
+//     0x1900 DrvPalRAM   0x0200  main Z80 9C00-9DFF
+//     0x1B00 DrvVidRegs  0x0100  main Z80 9E00-9EFF
+//     0x1C00 DrvBgRAM0   0x0800  main Z80 B000-B7FF
+//     0x2400 DrvBgRAM1   0x0800  main Z80 A800-AFFF
+//     0x2C00 DrvBgRAM2   0x0800  main Z80 A000-A7FF
+//     0x3400 DrvRadarRAM 0x0800  main Z80 B800-BBFF (0x3400-0x37FF)
+//     0x3C00 DrvZ80RAM1  0x0400  sound Z80 4000-43FF
+// The Z80s are 8-bit: shadow byte k is RA address k; the ARM region table is
+// the identity {0, 0x4000, 0}.
+//
+// Both Z80s run on ripple clocks divided from CLK_32M (4 and 2 MHz), so the
+// tap samples their buses on CLK_32M: a write cycle (MREQ+WR held for >= 12
+// CLK_32M clocks) is only taken once two consecutive samples agree on
+// strobe, address and data, and the older sample is written, so a sample
+// caught while the bus changes is never used. The writes are decoded by CPU
+// address, as FBNeo does.
+//
+// The only other DDR client is the screen rotation framebuffer, which runs on
+// CLK_VIDEO (CLK_48M), ignores DDRAM_BUSY and writes one pixel per CE_PIXEL
+// while VGA_DE is high. So the mirror is clocked by CLK_48M too (its shadow is
+// written from CLK_32M through dual-clock BRAM, same PLL), and it only starts a
+// copy once VGA_DE has been low for 4096 clocks (85 us, longer than any
+// HBlank): the copy (2k qwords, ~50 us) then runs in VBlank and the
+// framebuffer never loses a write. Held off during ROM download.
+
+   function automatic [16:0] ra_map_main(input [15:0] a);  // {valid, offset}
+      casez (a)
+         16'b1000_????_????_????: ra_map_main = { 1'b1, 4'h0, a[11:0] };        // 8000 -> 0x0000
+         16'b1001_0???_????_????: ra_map_main = { 1'b1, 5'b00010, a[10:0] };    // 9000 -> 0x1000
+         16'b1001_1000_????_????: ra_map_main = { 1'b1, 8'h18, a[7:0] };        // 9800 -> 0x1800
+         16'b1001_110?_????_????: ra_map_main = { 1'b1, 16'h1900 + {7'd0, a[8:0]} }; // 9C00 -> 0x1900
+         16'b1001_1110_????_????: ra_map_main = { 1'b1, 8'h1B, a[7:0] };        // 9E00 -> 0x1B00
+         16'b1011_0???_????_????: ra_map_main = { 1'b1, 16'h1C00 + {5'd0, a[10:0]} }; // B000 -> 0x1C00
+         16'b1010_1???_????_????: ra_map_main = { 1'b1, 16'h2400 + {5'd0, a[10:0]} }; // A800 -> 0x2400
+         16'b1010_0???_????_????: ra_map_main = { 1'b1, 16'h2C00 + {5'd0, a[10:0]} }; // A000 -> 0x2C00
+         16'b1011_10??_????_????: ra_map_main = { 1'b1, 6'b001101, a[9:0] };    // B800 -> 0x3400
+         default:                 ra_map_main = 17'd0;
+      endcase
+   endfunction
+
+   reg        rm_we1, rm_we2, rs_we1, rs_we2;
+   reg [15:0] rm_a1, rm_a2, rs_a1, rs_a2;
+   reg  [7:0] rm_d1, rm_d2, rs_d1, rs_d2;
+   always @(posedge CLK_32M) begin
+      { rm_we1, rm_a1, rm_d1 } <= { ra_cpu0_we, ra_cpu0_a, ra_cpu0_do };
+      { rm_we2, rm_a2, rm_d2 } <= { rm_we1, rm_a1, rm_d1 };
+      { rs_we1, rs_a1, rs_d1 } <= { ra_cpu1_we, ra_cpu1_a, ra_cpu1_do };
+      { rs_we2, rs_a2, rs_d2 } <= { rs_we1, rs_a1, rs_d1 };
+   end
+
+   wire [16:0] rm_map = ra_map_main(rm_a2);
+   wire        rm_ok  = rm_we1 & rm_we2 & rm_a1 == rm_a2 & rm_d1 == rm_d2 & rm_map[16];
+   wire        rs_ok  = rs_we1 & rs_we2 & rs_a1 == rs_a2 & rs_d1 == rs_d2 & rs_a2[15:10] == 6'b010000;
+
+   wire [14:0] ra_wr_word;
+   wire [15:0] ra_wr_din;
+   wire  [1:0] ra_wr_be;
+
+   starforce_ra_tap_merge #(.N(2)) ra_tap
+     (
+      .clk(CLK_32M),
+      .we({ rs_ok, rm_ok }),
+      .off({ 16'h3C00 + { 6'd0, rs_a2[9:0] }, rm_map[15:0] }),
+      .din({ rs_d2, rm_d2 }),
+      .ra_wr_word(ra_wr_word),
+      .ra_wr_din(ra_wr_din),
+      .ra_wr_be(ra_wr_be)
+      );
+
+   reg [1:0] ra_rst_s, ra_vbl_s, ra_dl_s;
+   always @(posedge CLK_48M) begin
+      ra_rst_s <= { ra_rst_s[0], iRST };
+      ra_vbl_s <= { ra_vbl_s[0], VBlank };
+      ra_dl_s  <= { ra_dl_s[0],  ioctl_download };
+   end
+
+   reg [11:0] ra_de_idle;
+   always @(posedge CLK_48M) begin
+      if (VGA_DE) ra_de_idle <= 0;
+      else if (~&ra_de_idle) ra_de_idle <= ra_de_idle + 1'd1;
+   end
+
+   wire  [7:0] ra_burstcnt, ra_be;
+   wire [28:0] ra_addr;
+   wire [63:0] ra_din;
+   wire        ra_we, ra_active;
+
+   starforce_ra_mirror #(.AW(14)) ra_mirror
+     (
+      .rst(ra_rst_s[1]),
+      .clk(CLK_48M),
+      .lvbl(~ra_vbl_s[1]),
+      .hold(ra_dl_s[1]),
+      .start_ok(&ra_de_idle),
+      .wr_clk(CLK_32M),
+      .wr_word(ra_wr_word),
+      .wr_din(ra_wr_din),
+      .wr_be(ra_wr_be),
+      .active(ra_active),
+      .ddr_busy(DDRAM_BUSY),
+      .ddr_burstcnt(ra_burstcnt),
+      .ddr_addr(ra_addr),
+      .ddr_we(ra_we),
+      .ddr_be(ra_be),
+      .ddr_din(ra_din)
+      );
+
+   assign DDRAM_CLK      = CLK_48M;
+   assign DDRAM_BURSTCNT = ra_active ? ra_burstcnt : rot_burstcnt;
+   assign DDRAM_ADDR     = ra_active ? ra_addr     : rot_addr;
+   assign DDRAM_DIN      = ra_active ? ra_din      : rot_din;
+   assign DDRAM_BE       = ra_active ? ra_be       : rot_be;
+   assign DDRAM_WE       = ra_active ? ra_we       : rot_we;
+   assign DDRAM_RD       = ra_active ? 1'b0        : rot_rd;
+
 endmodule

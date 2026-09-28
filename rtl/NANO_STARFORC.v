@@ -57,8 +57,15 @@ module NANO_STARFORC
   
    input wire [6:0]   UDLRTSC,
    input wire [15:0]  dipsw,
-	input wire muteki
- 
+	input wire muteki,
+
+   // RetroAchievements tap: both Z80 buses (ripple clocks from clk_32m)
+   output wire [15:0] ra_cpu0_a,
+   output wire [7:0]  ra_cpu0_do,
+   output wire        ra_cpu0_we,    // any memory write cycle
+   output wire [15:0] ra_cpu1_a,
+   output wire [7:0]  ra_cpu1_do,
+   output wire        ra_cpu1_we     // sound RAM write cycle
    );
 
    wire [15:0]      dipsw_port;
@@ -192,6 +199,14 @@ module NANO_STARFORC
    assign SOUT = bd1_sout;
         
    
+   // RetroAchievements tap (see the ports)
+   assign ra_cpu0_a  = CPU0_A;
+   assign ra_cpu0_do = CPU0_DO;
+   assign ra_cpu0_we = ~nMEWR;
+   assign ra_cpu1_a  = CPU1_A;
+   assign ra_cpu1_do = CPU1_DO;
+   assign ra_cpu1_we = sndram0_we;
+
    starforc_board1 gamemain1
      (
       .cpuclk (clk_4m_en),
